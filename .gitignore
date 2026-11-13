@@ -1,0 +1,21 @@
+# SPM build artifacts
+.build/
+
+# Xcode build products
+DerivedData/
+
+# macOS metadata
+.DS_Store
+
+# Xcode user-specific data
+xcuserdata/
+*.xcuserstate
+
+# SPM workspace metadata
+.swiftpm/
+
+# Agent tooling (local only)
+CLAUDE.md
+AGENTS.md
+.claude/
+.codex/
