@@ -672,6 +672,15 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
             let imageURL = ChatCompletionsClient.MessageContent.ImageURL(url: dataURL)
             return [ChatCompletionsClient.MessageContent(imageURL: imageURL)]
             #endif
+          // oMLX: name the custom data attachments added in iOS 27.2. This
+          // model doesn't opt in to any, so the framework rejects them first.
+          case .data:
+            throw LanguageModelError.unsupportedTranscriptContent(
+              LanguageModelError.UnsupportedTranscriptContent(
+                unsupportedContent: [entry],
+                debugDescription: "Data attachments are not supported by \(Self.self)."
+              )
+            )
           @unknown default:
             throw LanguageModelError.unsupportedTranscriptContent(
               LanguageModelError.UnsupportedTranscriptContent(
@@ -776,6 +785,11 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
             return nil
           }.joined()
           pendingReasoning = (pendingReasoning ?? "") + text
+
+        // oMLX: custom data entries (iOS 27.2) have no chat-completions form,
+        // and this model never emits them.
+        case .data:
+          continue
 
         @unknown default:
           continue
