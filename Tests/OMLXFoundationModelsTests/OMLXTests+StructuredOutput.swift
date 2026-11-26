@@ -183,6 +183,33 @@ extension OMLXTests {
       #expect(answer == "It's sunny, about 72.")
     }
 
+    @Test func `after reasoning, an answer cut short by the token limit says so`() async throws {
+      MockSSEProtocol.handler = { _ in
+        let lines = [
+          #"data: {"id":"1","model":"mock","choices":[{"delta":{"reasoning_content":"Thinking it over, at length"}}]}"#,
+          "",
+          #"data: {"id":"1","model":"mock","choices":[{"delta":{"content":"So the "},"finish_reason":"length"}]}"#,
+          "",
+          "data: [DONE]",
+          "",
+        ]
+        return (200, Data(lines.joined(separator: "\n").utf8))
+      }
+
+      let session = LanguageModelSession(model: makeMockModel(structuredOutput: .afterReasoning))
+      let error = await #expect(throws: OMLXLanguageModel.RequestError.self) {
+        try await session.respond(
+          to: "Weather?", generating: MockWeatherInfo.self,
+          options: GenerationOptions(maximumResponseTokens: 64))
+      }
+      guard case .answerCutShort(let answer)? = error else {
+        Issue.record("Expected answerCutShort, got \(String(describing: error))")
+        return
+      }
+      #expect(answer == "So the ")
+      #expect(error?.localizedDescription.contains("maximumResponseTokens") == true)
+    }
+
     @Test(arguments: [
       (#"{"a": 1}"#, #"{"a": 1}"#),
       (#"First {"draft": true}, then {"a": {"b": [1, 2]}}."#, #"{"a": {"b": [1, 2]}}"#),

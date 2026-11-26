@@ -169,6 +169,24 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
     public static let generationTokensPerSecond = "omlx.generationTokensPerSecond"
   }
 
+  // oMLX: a request's metadata can carry options that `GenerationOptions`
+  // has no place for.
+  /// Keys a request's metadata can hold to steer this model.
+  ///
+  /// ```swift
+  /// let response = try await session.respond(
+  ///   to: listing, generating: Verdict.self,
+  ///   metadata: [OMLXLanguageModel.RequestKey.seed: 42]
+  /// )
+  /// ```
+  public enum RequestKey {
+    /// A seed for this request's sampling (`Int`), so the same request gets
+    /// the same answer, sampled with the server's own settings. A
+    /// `GenerationOptions` sampling mode carries a seed only with top-k or
+    /// nucleus settings of its own; when it has one, it's used instead.
+    public static let seed = "omlx.seed"
+  }
+
   /// An error returned by the chat completions endpoint in the body of a
   /// failed request or a streaming error event.
   ///
@@ -188,6 +206,12 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
     /// A short machine-readable error code provided by the server.
     public var code: String?
 
+    // oMLX: keep the status, so a caller can tell a failure worth retrying,
+    // such as a 500 from a model evicted mid-request, from one that isn't.
+    /// The HTTP status code, or `nil` for an error the server sent in the
+    /// body of a reply already under way.
+    public var statusCode: Int?
+
     /// Creates a new API error.
     ///
     /// - Parameters:
@@ -195,13 +219,16 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
     ///   - type: The error category reported by the server.
     ///   - param: The request parameter associated with the error.
     ///   - code: A short machine-readable error code.
+    ///   - statusCode: The HTTP status code.
     public init(
       message: String,
       type: String? = nil,
       param: String? = nil,
-      code: String? = nil
+      code: String? = nil,
+      statusCode: Int? = nil
     ) {
       self.message = message
+      self.statusCode = statusCode
       self.type = type
       self.param = param
       self.code = code
@@ -231,6 +258,12 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
     /// model's answer had no JSON in it. The associated value is the answer.
     case answerWithoutJSON(_ answer: String)
 
+    /// With ``OMLXLanguageModel/StructuredOutput/afterReasoning``, the model
+    /// ran out of response tokens before it wrote its JSON, often while it
+    /// was still reasoning. Raise `GenerationOptions.maximumResponseTokens`.
+    /// The associated value is the answer so far.
+    case answerCutShort(_ answer: String)
+
     public var errorDescription: String? {
       switch self {
       case .invalidRequest(let description):
@@ -244,6 +277,8 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         """
       case .answerWithoutJSON(let answer):
         "The model's answer had no JSON in it: \(answer.prefix(300))"
+      case .answerCutShort:
+        "The model ran out of response tokens before it answered. Raise maximumResponseTokens."
       }
     }
   }
@@ -298,7 +333,8 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         message: envelope.error.message,
         type: envelope.error.type,
         param: envelope.error.param,
-        code: envelope.error.code
+        code: envelope.error.code,
+        statusCode: statusCode
       )
     }
     if let statusCode {
@@ -393,6 +429,7 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         for: request.generationOptions.samplingMode,
         temperature: request.generationOptions.temperature
       )
+      let seed = try sampling.seed ?? Self.seed(in: request.metadata)
 
       // Translate the framework's request into the OpenAI-compatible wire format.
       let chatRequest = ChatCompletionsClient.ChatCompletionRequest(
@@ -401,7 +438,7 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         temperature: sampling.temperature,
         topP: sampling.topP,
         topK: sampling.topK,
-        seed: sampling.seed,
+        seed: seed,
         maxCompletionTokens: request.generationOptions.maximumResponseTokens,
         tools: request.enabledToolDefinitions.map { tool in
           ChatCompletionsClient.Tool(
@@ -516,12 +553,14 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
       var answer = ""
       var answerTokenCount = 0
       var calledTools = false
+      var finishReason: String?
       var heldUsage: (usage: ChatCompletionsClient.ChatCompletionChunk.Usage, model: String)?
 
       for try await chunk in chunks {
         // oMLX: stop promptly when the caller cancels.
         try Task.checkCancellation()
 
+        if let reason = chunk.choices.first?.finishReason { finishReason = reason }
         if let delta = chunk.choices.first?.delta {
           // oMLX: skip the empty deltas oMLX sends as keep-alives.
           if var reasoning = delta.reasoningContent {
@@ -600,7 +639,9 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
       guard readsJSONFromAnswer else { return }
       if !answer.isEmpty || !calledTools {
         guard let json = Self.lastJSONValue(in: answer) else {
-          throw OMLXLanguageModel.RequestError.answerWithoutJSON(answer)
+          throw finishReason == "length"
+            ? OMLXLanguageModel.RequestError.answerCutShort(answer)
+            : OMLXLanguageModel.RequestError.answerWithoutJSON(answer)
         }
         await channel.send(
           .response(entryID: responseEntryID, action: .appendText(json, tokenCount: answerTokenCount))
@@ -727,6 +768,17 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
           "Unknown sampling mode \(mode.kind) is not supported"
         )
       }
+    }
+
+    // oMLX: the seed a request's metadata carries, if any.
+    private static func seed(in metadata: [String: GeneratedContent]) throws -> UInt64? {
+      guard let content = metadata[OMLXLanguageModel.RequestKey.seed] else { return nil }
+      guard let seed = try? content.value(Int.self), seed >= 0 else {
+        throw OMLXLanguageModel.RequestError.invalidRequest(
+          "\(OMLXLanguageModel.RequestKey.seed) should be a whole number, 0 or more."
+        )
+      }
+      return UInt64(seed)
     }
 
     // oMLX: reasoning levels become `reasoning_effort` (each chat template
@@ -1227,6 +1279,13 @@ private struct ChatCompletionsClient {
 
     struct Choice: Decodable {
       let delta: Delta
+      // oMLX: `"length"` when the model ran out of response tokens.
+      let finishReason: String?
+
+      enum CodingKeys: String, CodingKey {
+        case delta
+        case finishReason = "finish_reason"
+      }
 
       struct Delta: Decodable {
         var role: String?

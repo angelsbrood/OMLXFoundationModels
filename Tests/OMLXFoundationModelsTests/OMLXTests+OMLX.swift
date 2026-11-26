@@ -89,7 +89,7 @@ extension OMLXTests {
       let session = LanguageModelSession(model: makeMockModel())
       let _ = try await session.respond(
         to: "test",
-        options: GenerationOptions(sampling: .greedy, temperature: 0.7)
+        options: GenerationOptions(samplingMode: .greedy, temperature: 0.7)
       )
 
       let body = try requestBody()
@@ -103,7 +103,7 @@ extension OMLXTests {
       let session = LanguageModelSession(model: makeMockModel())
       let _ = try await session.respond(
         to: "test",
-        options: GenerationOptions(sampling: .random(top: 20, seed: 7), temperature: 0.6)
+        options: GenerationOptions(samplingMode: .random(top: 20, seed: 7), temperature: 0.6)
       )
 
       let body = try requestBody()
@@ -118,12 +118,47 @@ extension OMLXTests {
       let session = LanguageModelSession(model: makeMockModel())
       let _ = try await session.respond(
         to: "test",
-        options: GenerationOptions(sampling: .random(probabilityThreshold: 0.95, seed: 3))
+        options: GenerationOptions(samplingMode: .random(probabilityThreshold: 0.95, seed: 3))
       )
 
       let body = try requestBody()
       #expect(body["top_p"] as? Double == 0.95)
       #expect(body["seed"] as? Int == 3)
+    }
+
+    @Test func `a seed in the request's metadata keeps the server's sampling`() async throws {
+      MockSSEProtocol.handler = { _ in (200, MockSSE.text("OK")) }
+
+      let session = LanguageModelSession(model: makeMockModel())
+      let _ = try await session.respond(
+        to: "test", metadata: [OMLXLanguageModel.RequestKey.seed: 1_234_567])
+
+      let body = try requestBody()
+      #expect(body["seed"] as? Int == 1_234_567)
+      #expect(body["top_p"] == nil)
+      #expect(body["top_k"] == nil)
+      #expect(body["temperature"] == nil)
+    }
+
+    @Test func `a sampling mode's seed comes before the metadata's`() async throws {
+      MockSSEProtocol.handler = { _ in (200, MockSSE.text("OK")) }
+
+      let session = LanguageModelSession(model: makeMockModel())
+      let _ = try await session.respond(
+        to: "test",
+        options: GenerationOptions(samplingMode: .random(top: 20, seed: 7)),
+        metadata: [OMLXLanguageModel.RequestKey.seed: 99])
+
+      #expect(try requestBody()["seed"] as? Int == 7)
+    }
+
+    @Test func `a seed must be a whole number`() async throws {
+      MockSSEProtocol.handler = { _ in (200, MockSSE.text("OK")) }
+
+      let session = LanguageModelSession(model: makeMockModel())
+      await #expect(throws: OMLXLanguageModel.RequestError.self) {
+        try await session.respond(to: "test", metadata: [OMLXLanguageModel.RequestKey.seed: "seven"])
+      }
     }
 
     // MARK: Errors
@@ -188,6 +223,7 @@ extension OMLXTests {
       } catch let error as OMLXLanguageModel.APIError {
         #expect(error.message == "Invalid API key")
         #expect(error.localizedDescription == "Invalid API key")
+        #expect(error.statusCode == 401)
       }
     }
 

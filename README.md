@@ -28,6 +28,10 @@ Built at Moon.
 Swift package at the repo root; product `OMLXFoundationModels`; iOS, macOS and
 visionOS 27+; no dependencies.
 
+```swift
+.package(url: "https://github.com/angelsbrood/omlxfoundationmodels", from: "0.2.0"),
+```
+
 It's a fork of `ChatCompletionsLanguageModel` from Apple's
 [foundation-models-utilities](https://github.com/apple/foundation-models-utilities)
 1.1.0, kept as one file shaped like the original so Apple's updates can be
@@ -43,8 +47,9 @@ Apple's tests are ported alongside new ones for the fork's behavior.
 | `.greedy` sampling | `top_p: 0` (oMLX reads this as "off") | `temperature: 0` |
 | `.random(top:seed:)` | throws | `top_k`, `seed` |
 | `.random(probabilityThreshold:seed:)` | throws if seeded | `top_p`, `seed` |
+| `RequestKey.seed` in a request's `metadata` | — | `seed` alone, so the server's own sampling settings stay as they are |
 | `@Generable` / schemas | `response_format`, which oMLX quietly stops enforcing if it can't compile the schema | `structured_outputs`, which fails with an error instead; the schema is also described in the latest user message unless `includeSchemaInPrompt` is `false` |
-| `@Generable`, with `structuredOutput: .afterReasoning` | — | no grammar: the schema is described in the latest user message, the model reasons, and the JSON is read from its answer. A request with reasoning off gets the grammar |
+| `@Generable`, with `structuredOutput: .afterReasoning` | — | no grammar: the schema is described in the latest user message, the model reasons, and the JSON is read from its answer. A request with reasoning off gets the grammar. An answer that runs out of response tokens before its JSON throws `RequestError.answerCutShort` |
 | Context overflow | `RequestError.httpError` | `LanguageModelError.contextSizeExceeded` with the token counts |
 | 429, or 503 when the queue is full | `RequestError.httpError` | `LanguageModelError.rateLimited`, with `resetDate` from `Retry-After` |
 | `session.prewarm()` | no-op | one-token request that loads the model and caches the instructions and tools |
@@ -72,7 +77,8 @@ let speed = try? response.metadata[OMLXLanguageModel.MetadataKey.generationToken
   asked whether 1,001 is prime, it said yes, with the field's guide copied in
   as the reason. Qwen3.8 thinks first. For Inkling, create the model with
   `structuredOutput: .afterReasoning`; it then reasons as usual and gets the
-  answer right. Its reasoning streams, and the answer arrives once it's done.
+  answer right. Its reasoning and its answer arrive once it's done: a session
+  shows reasoning together with the response it leads to.
 - **Inkling 2 always thinks.** Its chat template doesn't turn thinking off, so
   `.custom("none")` has no effect on it.
 - **Structured output turns off Lightning MTP.** Grammar-constrained decoding
