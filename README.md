@@ -44,6 +44,7 @@ Apple's tests are ported alongside new ones for the fork's behavior.
 | `.random(top:seed:)` | throws | `top_k`, `seed` |
 | `.random(probabilityThreshold:seed:)` | throws if seeded | `top_p`, `seed` |
 | `@Generable` / schemas | `response_format`, which oMLX quietly stops enforcing if it can't compile the schema | `structured_outputs`, which fails with an error instead; the schema is also described in the latest user message unless `includeSchemaInPrompt` is `false` |
+| `@Generable`, with `structuredOutput: .afterReasoning` | — | no grammar: the schema is described in the latest user message, the model reasons, and the JSON is read from its answer. A request with reasoning off gets the grammar |
 | Context overflow | `RequestError.httpError` | `LanguageModelError.contextSizeExceeded` with the token counts |
 | 429, or 503 when the queue is full | `RequestError.httpError` | `LanguageModelError.rateLimited`, with `resetDate` from `Retry-After` |
 | `session.prewarm()` | no-op | one-token request that loads the model and caches the instructions and tools |
@@ -66,6 +67,14 @@ let speed = try? response.metadata[OMLXLanguageModel.MetadataKey.generationToken
   same `xhigh` as passing no level. The template puts the level in the system
   prompt, so changing it mid-conversation means oMLX re-reads the whole
   history.
+- **Inkling 2 skips its reasoning under a grammar.** At every reasoning
+  level it goes straight to the constrained answer, and the answer suffers:
+  asked whether 1,001 is prime, it said yes, with the field's guide copied in
+  as the reason. Qwen3.8 thinks first. For Inkling, create the model with
+  `structuredOutput: .afterReasoning`; it then reasons as usual and gets the
+  answer right. Its reasoning streams, and the answer arrives once it's done.
+- **Inkling 2 always thinks.** Its chat template doesn't turn thinking off, so
+  `.custom("none")` has no effect on it.
 - **Structured output turns off Lightning MTP.** Grammar-constrained decoding
   doesn't use MTP speculation, so `@Generable` requests run at plain decode
   speed.
@@ -116,6 +125,10 @@ Live tests run against a real server when `OMLX_TEST_ENDPOINT` is set:
 ```
 OMLX_TEST_ENDPOINT=http://127.0.0.1:8000/v1 OMLX_TEST_API_KEY=<key> swift test --filter Live
 ```
+
+`OMLX_TEST_MODEL` picks the model. To keep the key out of your scheme, set
+`OMLX_TEST_KEYCHAIN_SERVICE` to a Keychain item's service instead; its account
+is the endpoint's `host:port`.
 
 ## License
 

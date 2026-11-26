@@ -26,7 +26,8 @@ func makeMockModel(
   url: URL = URL(string: "https://mock-llm.test/v1")!,
   headers: [String: String] = [:],
   apiKey: String? = nil,
-  supportsGuidedGeneration: Bool = true
+  supportsGuidedGeneration: Bool = true,
+  structuredOutput: OMLXLanguageModel.StructuredOutput = .grammar
 ) -> OMLXLanguageModel {
   let config = URLSessionConfiguration.ephemeral
   config.protocolClasses = [MockSSEProtocol.self]
@@ -35,7 +36,8 @@ func makeMockModel(
     url: url,
     apiKey: apiKey,
     additionalHeaders: headers,
-    supportsGuidedGeneration: supportsGuidedGeneration
+    supportsGuidedGeneration: supportsGuidedGeneration,
+    structuredOutput: structuredOutput
   )
   model.urlSession = URLSession(configuration: config)
   return model

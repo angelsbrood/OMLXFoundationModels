@@ -62,6 +62,10 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
 
   public var supportsGuidedGeneration: Bool
 
+  // oMLX: how a `Generable` answer is made to fit its schema.
+  /// How oMLX makes a response fit a `Generable` type.
+  public var structuredOutput: StructuredOutput
+
   // Overridden in tests to inject a URLSession with mock protocol handlers.
   var urlSession: URLSession?
 
@@ -77,6 +81,10 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
   ///   - additionalHeaders: Headers to merge on top of the defaults.
   ///   - supportsGuidedGeneration: Whether to declare guided generation.
   ///     Defaults to `true`; oMLX enforces schemas with a grammar.
+  ///   - structuredOutput: How oMLX makes a response fit a `Generable`
+  ///     type. Defaults to ``StructuredOutput/grammar``; use
+  ///     ``StructuredOutput/afterReasoning`` for models that skip their
+  ///     reasoning under a grammar, such as Inkling 2.
   ///   - urlSessionConfiguration: An optional `URLSessionConfiguration` used
   ///     to build the `URLSession` that drives requests. Use this to tune
   ///     timeouts, proxies, or other transport settings. When `nil`, an
@@ -87,6 +95,7 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
     apiKey: String? = nil,
     additionalHeaders: [String: String] = [:],
     supportsGuidedGeneration: Bool = true,
+    structuredOutput: StructuredOutput = .grammar,
     urlSessionConfiguration: URLSessionConfiguration? = nil
   ) {
     self.name = name
@@ -99,6 +108,7 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
     }
     self.additionalHeaders = headers
     self.supportsGuidedGeneration = supportsGuidedGeneration
+    self.structuredOutput = structuredOutput
     self.urlSession = urlSessionConfiguration.map { URLSession(configuration: $0) }
   }
 
@@ -116,8 +126,28 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
       modelName: name,
       url: url,
       additionalHeaders: additionalHeaders,
+      structuredOutput: structuredOutput,
       urlSession: urlSession
     )
+  }
+
+  // oMLX: a reasoning model that oMLX frames properly thinks before a
+  // grammar-constrained answer. Inkling 2 doesn't: under a grammar it skips
+  // its reasoning at every level and writes a worse answer.
+  /// How oMLX makes a response fit a `Generable` type.
+  public enum StructuredOutput: Hashable, Sendable {
+    /// oMLX constrains the answer with a grammar compiled from the schema, so
+    /// it always fits. Reasoning models that oMLX frames for it, such as
+    /// Qwen, still think first.
+    case grammar
+
+    /// The model reads the schema in the prompt, reasons as it would about
+    /// any question, then writes its answer, and the answer's JSON is taken
+    /// from what it wrote. For models that skip their reasoning under a
+    /// grammar, such as Inkling 2. The answer arrives whole, once the model
+    /// has finished; its reasoning still streams. A request that turns
+    /// reasoning off gets the grammar.
+    case afterReasoning
   }
 
   // oMLX: keys for the server-reported timing that this model attaches to
@@ -195,6 +225,12 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
     /// values contain the status code and the raw response body.
     case httpError(statusCode: Int, data: Data)
 
+    // oMLX: with `StructuredOutput.afterReasoning`, the answer must contain
+    // the JSON it's read from.
+    /// With ``OMLXLanguageModel/StructuredOutput/afterReasoning``, the
+    /// model's answer had no JSON in it. The associated value is the answer.
+    case answerWithoutJSON(_ answer: String)
+
     public var errorDescription: String? {
       switch self {
       case .invalidRequest(let description):
@@ -206,6 +242,8 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         HTTP error with status code \(statusCode):
         \(String(data: data, encoding: .utf8) ?? data.description)
         """
+      case .answerWithoutJSON(let answer):
+        "The model's answer had no JSON in it: \(answer.prefix(300))"
       }
     }
   }
@@ -281,18 +319,21 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
       fileprivate let modelName: String
       fileprivate let url: URL
       fileprivate let additionalHeaders: [String: String]
+      fileprivate let structuredOutput: StructuredOutput
       fileprivate let urlSession: URLSession?
 
       public static func == (lhs: Configuration, rhs: Configuration) -> Bool {
         lhs.modelName == rhs.modelName
           && lhs.url == rhs.url
           && lhs.additionalHeaders == rhs.additionalHeaders
+          && lhs.structuredOutput == rhs.structuredOutput
       }
 
       public func hash(into hasher: inout Hasher) {
         hasher.combine(modelName)
         hasher.combine(url)
         hasher.combine(additionalHeaders)
+        hasher.combine(structuredOutput)
       }
     }
 
@@ -325,10 +366,24 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
 
       var messages = try convertedTranscript(request.transcript)
 
+      // oMLX: translate the framework's reasoning level into the chat
+      // template's thinking controls.
+      let reasoning = Self.reasoning(for: request.contextOptions.reasoningLevel)
+
+      // oMLX: with `.afterReasoning`, the schema is asked for in words and
+      // the answer's JSON is read from the reply, unless reasoning is off.
+      let readsJSONFromAnswer =
+        request.schema != nil
+        && configuration.structuredOutput == .afterReasoning
+        && reasoning.enableThinking != false
+
       // oMLX: the grammar enforces the schema's shape, but the model only
       // learns what each field means from the prompt. Honor
-      // `includeSchemaInPrompt` (on unless the caller turns it off).
-      if let schema = request.schema, request.contextOptions.includeSchemaInPrompt != false {
+      // `includeSchemaInPrompt` (on unless the caller turns it off). Without
+      // a grammar, the prompt is all the model has, so it's always included.
+      if let schema = request.schema,
+        readsJSONFromAnswer || request.contextOptions.includeSchemaInPrompt != false
+      {
         try Self.appendSchemaInstruction(for: schema, to: &messages)
       }
 
@@ -338,10 +393,6 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         for: request.generationOptions.samplingMode,
         temperature: request.generationOptions.temperature
       )
-
-      // oMLX: translate the framework's reasoning level into the chat
-      // template's thinking controls.
-      let reasoning = Self.reasoning(for: request.contextOptions.reasoningLevel)
 
       // Translate the framework's request into the OpenAI-compatible wire format.
       let chatRequest = ChatCompletionsClient.ChatCompletionRequest(
@@ -374,9 +425,11 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         // oMLX: `structured_outputs` fails loudly when a schema can't be
         // compiled to a grammar; `response_format` would quietly fall back to
         // unenforced JSON.
-        structuredOutputs: request.schema.map { schema in
-          ChatCompletionsClient.StructuredOutputs(json: schema)
-        },
+        structuredOutputs: readsJSONFromAnswer
+          ? nil
+          : request.schema.map { schema in
+            ChatCompletionsClient.StructuredOutputs(json: schema)
+          },
         reasoningEffort: reasoning.effort,
         enableThinking: reasoning.enableThinking
       )
@@ -384,7 +437,8 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
       // Stream the response back into the framework via `channel`.
       try await Self.processChunks(
         client.streamChatCompletions(request: chatRequest),
-        into: channel
+        into: channel,
+        readsJSONFromAnswer: readsJSONFromAnswer
       )
     }
 
@@ -433,7 +487,8 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
 
     private static func processChunks<ChunkSequence: AsyncSequence>(
       _ chunks: ChunkSequence,
-      into channel: LanguageModelExecutorGenerationChannel
+      into channel: LanguageModelExecutorGenerationChannel,
+      readsJSONFromAnswer: Bool = false
     ) async throws where ChunkSequence.Element == ChatCompletionsClient.ChatCompletionChunk {
       // Per-index `id`/`name` for tool calls. The first delta for a given
       // index supplies them; later deltas at the same index typically carry
@@ -454,6 +509,14 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
       // block. Drop leading whitespace so each entry starts with visible text.
       var hasReasoningText = false
       var hasResponseText = false
+
+      // oMLX: with `StructuredOutput.afterReasoning`, the answer is held back
+      // until it's complete, so its JSON can be read from it, and so is the
+      // usage that follows it.
+      var answer = ""
+      var answerTokenCount = 0
+      var calledTools = false
+      var heldUsage: (usage: ChatCompletionsClient.ChatCompletionChunk.Usage, model: String)?
 
       for try await chunk in chunks {
         // oMLX: stop promptly when the caller cancels.
@@ -486,6 +549,7 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
               toolCallRouting[toolCallDelta.index] = routing
 
               guard !routing.id.isEmpty, !routing.name.isEmpty else { continue }
+              calledTools = true
 
               await channel.send(
                 .toolCalls(
@@ -505,7 +569,11 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
             if !hasResponseText {
               text = String(text.drop(while: \.isWhitespace))
             }
-            if !text.isEmpty {
+            if !text.isEmpty, readsJSONFromAnswer {
+              hasResponseText = true
+              answer += text
+              answerTokenCount += 1
+            } else if !text.isEmpty {
               hasResponseText = true
               await channel.send(
                 .response(
@@ -520,40 +588,124 @@ public struct OMLXLanguageModel: Sendable, LanguageModel {
         // Send usage AFTER content so the authoritative cumulative total
         // overwrites any tokens credited by `appendText` for this chunk.
         if let usage = chunk.usage {
-          await channel.send(
-            .response(
-              entryID: responseEntryID,
-              action: .updateUsage(
-                input: .init(
-                  totalTokenCount: usage.promptTokens,
-                  cachedTokenCount: usage.promptTokensDetails?.cachedTokens ?? 0
-                ),
-                output: .init(
-                  totalTokenCount: usage.completionTokens,
-                  reasoningTokenCount: usage.completionTokensDetails?.reasoningTokens ?? 0
-                )
-              )
-            )
-          )
-
-          // oMLX: attach the server's own timing to the response entry.
-          var metadata: [String: any ConvertibleToGeneratedContent] = [
-            MetadataKey.model: chunk.model
-          ]
-          if let value = usage.timeToFirstToken {
-            metadata[MetadataKey.timeToFirstToken] = value
+          if readsJSONFromAnswer {
+            heldUsage = (usage, chunk.model)
+          } else {
+            await sendUsage(usage, model: chunk.model, entryID: responseEntryID, into: channel)
           }
-          if let value = usage.promptTokensPerSecond {
-            metadata[MetadataKey.promptTokensPerSecond] = value
-          }
-          if let value = usage.generationTokensPerSecond {
-            metadata[MetadataKey.generationTokensPerSecond] = value
-          }
-          await channel.send(
-            .response(entryID: responseEntryID, action: .updateMetadata(metadata))
-          )
         }
       }
+
+      // oMLX: read the JSON from the finished answer, then report usage.
+      guard readsJSONFromAnswer else { return }
+      if !answer.isEmpty || !calledTools {
+        guard let json = Self.lastJSONValue(in: answer) else {
+          throw OMLXLanguageModel.RequestError.answerWithoutJSON(answer)
+        }
+        await channel.send(
+          .response(entryID: responseEntryID, action: .appendText(json, tokenCount: answerTokenCount))
+        )
+      }
+      if let heldUsage {
+        await sendUsage(heldUsage.usage, model: heldUsage.model, entryID: responseEntryID, into: channel)
+      }
+    }
+
+
+    // oMLX: usage, and the server's own timing, for the response entry.
+    private static func sendUsage(
+      _ usage: ChatCompletionsClient.ChatCompletionChunk.Usage,
+      model: String,
+      entryID responseEntryID: String,
+      into channel: LanguageModelExecutorGenerationChannel
+    ) async {
+      await channel.send(
+        .response(
+          entryID: responseEntryID,
+          action: .updateUsage(
+            input: .init(
+              totalTokenCount: usage.promptTokens,
+              cachedTokenCount: usage.promptTokensDetails?.cachedTokens ?? 0
+            ),
+            output: .init(
+              totalTokenCount: usage.completionTokens,
+              reasoningTokenCount: usage.completionTokensDetails?.reasoningTokens ?? 0
+            )
+          )
+        )
+      )
+
+      // oMLX: attach the server's own timing to the response entry.
+      var metadata: [String: any ConvertibleToGeneratedContent] = [
+        MetadataKey.model: model
+      ]
+      if let value = usage.timeToFirstToken {
+        metadata[MetadataKey.timeToFirstToken] = value
+      }
+      if let value = usage.promptTokensPerSecond {
+        metadata[MetadataKey.promptTokensPerSecond] = value
+      }
+      if let value = usage.generationTokensPerSecond {
+        metadata[MetadataKey.generationTokensPerSecond] = value
+      }
+      await channel.send(
+        .response(entryID: responseEntryID, action: .updateMetadata(metadata))
+      )
+    }
+
+    // oMLX: the answer's JSON is the last complete object or array in it,
+    // which skips any prose or code fence around it. A whole answer that's a
+    // JSON value of another kind, such as `true`, counts too.
+    static func lastJSONValue(in answer: String) -> String? {
+      func parses(_ text: Substring) -> Bool {
+        (try? JSONSerialization.jsonObject(with: Data(text.utf8), options: .fragmentsAllowed)) != nil
+      }
+
+      var spans: [Range<String.Index>] = []
+      var depth = 0
+      var start: String.Index?
+      var inString = false
+      var escaped = false
+      var index = answer.startIndex
+      while index < answer.endIndex {
+        let character = answer[index]
+        if inString {
+          if escaped {
+            escaped = false
+          } else if character == "\\" {
+            escaped = true
+          } else if character == "\"" {
+            inString = false
+          }
+        } else if character == "\"" {
+          inString = depth > 0
+        } else if character == "{" || character == "[" {
+          if depth == 0 { start = index }
+          depth += 1
+        } else if (character == "}" || character == "]"), depth > 0 {
+          depth -= 1
+          if depth == 0, let start {
+            spans.append(start..<answer.index(after: index))
+          }
+        }
+        index = answer.index(after: index)
+      }
+      for span in spans.reversed() where parses(answer[span]) {
+        return String(answer[span])
+      }
+
+      // A stray bracket in the prose can leave the spans unbalanced. Then
+      // take the longest object or array that ends at the answer's last
+      // closing bracket.
+      if let end = answer.lastIndex(where: { $0 == "}" || $0 == "]" }) {
+        let starts = answer[...end].indices.filter { answer[$0] == "{" || answer[$0] == "[" }
+        for start in starts where parses(answer[start...end]) {
+          return String(answer[start...end])
+        }
+      }
+
+      let whole = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+      return !whole.isEmpty && parses(Substring(whole)) ? whole : nil
     }
 
     // oMLX: replaces upstream's `topP(_:)`, which rejected top-k and seeds
